@@ -1,6 +1,7 @@
 use rand::random;
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 
 // Prototype neural network that focuses on facilitating an all-node-input-all-node-output network. The idea is that all neurons in the brain are interconnected and are used as both input and output simultaneously.
@@ -56,6 +57,7 @@ pub struct Edge {
 pub struct MorassWeb {
     nodes: Vec<Rc<RefCell<Node>>>,
     edges: Vec<Rc<RefCell<Edge>>>,
+    pairs: HashSet<(usize, usize)>, // usize representation of edges
     op_counter: usize,
 }
 
@@ -87,31 +89,39 @@ impl MorassWeb {
 
         // Make n random pairs of integers where n=num_edges and each integer is in the range [0, num_nodes)
         // Each pair is unique, (i, i) is not allowed, and (i, j) is the same as (j, i)
-        let mut pairs = Vec::<(usize, usize)>::new();
+        let mut pairs = HashSet::<(usize, usize)>::new();
+        let mut tries = 0;
         for _ in 0..num_edges {
             let mut pair = (random::<usize>() % num_nodes, random::<usize>() % num_nodes);
-            while pair.0 == pair.1 || pairs.contains(&pair) {
+            while pair.0 == pair.1 || pairs.contains(&pair) || pairs.contains(&(pair.1, pair.0)) {
                 pair = (random::<usize>() % num_nodes, random::<usize>() % num_nodes);
+                tries += 1;
+                if tries > 1000 {
+                    println!("Could not find {} unique pairs", num_edges);
+                    println!("Found {} unique pairs", pairs.len());
+                    return Self {
+                        nodes,
+                        edges,
+                        pairs,
+                        op_counter: 0,
+                    };
+                }
             }
-            pairs.push(pair);
+            pairs.insert(pair);
         }
 
-        // Make a web with no edges
-        let out_self = Self {
-            nodes,
-            edges,
-            op_counter: 0,
-        };
-        edges = Vec::new();
-        for pair in pairs {
+        // Create edge with random parameters
+        for pair in pairs.iter() {
             // Create edge with random parameters
-            let edge = out_self.default_edge(&pair);
+            let edge = MorassWeb::default_edge(nodes.get(pair.0).unwrap(),
+                                               nodes.get(pair.1).unwrap());
             edges.push(Rc::new(RefCell::new(edge)));
         }
-        nodes = out_self.nodes;
+
         Self {
             nodes,
             edges,
+            pairs,
             op_counter: 0,
         }
     }
@@ -149,8 +159,18 @@ impl MorassWeb {
                 edge.edge_health.set(edge.edge_health.get()-1);
             }
         }
-        // Remove dead edges
-        self.edges.retain(|edge| edge.borrow().edge_health.get() > 0);
+        // Delete any edges with edge_health == 0 and their corresponding pairs
+        let mut to_remove = Vec::<usize>::new();
+        for (i, edge) in self.edges.iter().enumerate() {
+            if edge.borrow().edge_health.get() == 0 {
+                to_remove.push(i);
+            }
+        }
+        for i in to_remove.iter().rev() {
+            let edge = self.edges.remove(*i);
+            let pair = (edge.borrow().start_node.borrow().id, edge.borrow().end_node.borrow().id);
+            self.pairs.remove(&pair);
+        }
     }
 
     fn assimilate(&self) {
@@ -187,8 +207,8 @@ impl MorassWeb {
     }
 
     fn pulse(&mut self, verbose: bool) {
-        for edge in &self.edges {
-            let edge = edge.borrow();
+        for _edge in &self.edges {
+            let edge = _edge.borrow();
             let start_node = edge.start_node.borrow();
             let end_node = edge.end_node.borrow();
 
@@ -220,7 +240,7 @@ impl MorassWeb {
         }
     }
 
-    pub fn default_edge(&self, pair: &(usize, usize)) -> Edge {
+    pub fn default_edge(start_node: &Rc<RefCell<Node>>, end_node: &Rc<RefCell<Node>>) -> Edge {
         Edge {
             out_percentage: random::<f64>(),
             out_fixed: random::<f64>() * 5.0,
@@ -228,8 +248,8 @@ impl MorassWeb {
             last_fire: Cell::new(0),
             fire_within: 5,
             end_node_fire_within: 3,
-            start_node: Rc::clone(&self.nodes[pair.0]),
-            end_node: Rc::clone(&self.nodes[pair.1]),
+            start_node: Rc::clone(start_node),
+            end_node: Rc::clone(end_node),
         }
     }
 
@@ -269,23 +289,32 @@ impl MorassWeb {
         self.op_counter
     }
 
-    pub fn add_edges_to_random_node(&mut self, num_edges: usize) {
-        let mut pairs = Vec::<(usize, usize)>::new();
+    pub fn add_edges_to_random_node(&mut self, num_edges: usize, max_tries: usize) {
         let mut target_node = random::<usize>() % self.nodes.len();
+        let mut tries = 1;
         while self.nodes[target_node].borrow().num_outgoing_edges.get() + num_edges >= self.nodes.len() {
             // If the target node has too many outgoing edges, pick a new target node
             target_node = random::<usize>() % self.nodes.len();
         }
+        let mut new_pairs = HashSet::<(usize, usize)>::new();
         for _ in 0..num_edges {
             let mut pair = (random::<usize>() % self.nodes.len(), random::<usize>() % self.nodes.len());
-            while pair.0 == pair.1 || pairs.contains(&pair) {
+            while pair.0 == pair.1 ||
+                self.pairs.contains(&pair) ||
+                self.pairs.contains(&(pair.1, pair.0)) {
                 pair = (target_node, random::<usize>() % self.nodes.len());
+                tries += 1;
+                if tries > max_tries {
+                    return;
+                }
             }
-            pairs.push(pair);
+            self.pairs.insert(pair);
+            new_pairs.insert(pair);
         }
-        for pair in pairs {
+        for pair in new_pairs.iter() {
             // Create edge with random parameters
-            let edge = self.default_edge(&pair);
+            let edge = MorassWeb::default_edge(self.nodes.get(pair.0).unwrap(),
+                                               self.nodes.get(pair.1).unwrap());
             self.edges.push(Rc::new(RefCell::new(edge)));
         }
     }
