@@ -1,7 +1,8 @@
 use rand::random;
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::rc::Rc;
 
 // Prototype neural network that focuses on facilitating an all-node-input-all-node-output network. The idea is that all neurons in the brain are interconnected and are used as both input and output simultaneously.
@@ -22,6 +23,7 @@ use std::rc::Rc;
 // Cf: Charge consumption fixed; when the threshold is triggered, this fixed value is subtracted from the current charge (before Cp)
 // Dp: Decay percentage; this is how much the current charge decays every step current_chg*=(1-Dp)
 // Df: Decay fixed; this value is subtracted from the current charge every step
+#[derive(PartialEq)]
 pub struct Node {
     id: usize,
     threshold: f64,
@@ -36,6 +38,16 @@ pub struct Node {
     decay_percentage: f64,
     decay_fixed: f64,
 }
+
+impl Hash for Node {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl Eq for Node {}
+
+
 
 // An edge is defined with the following parameters:
 //
@@ -56,6 +68,7 @@ pub struct Edge {
 
 pub struct MorassWeb {
     nodes: Vec<Rc<RefCell<Node>>>,
+    node_connections: HashMap<usize, usize>,
     edges: Vec<Rc<RefCell<Edge>>>,
     pairs: HashSet<(usize, usize)>, // usize representation of edges
     op_counter: usize,
@@ -67,6 +80,7 @@ impl MorassWeb {
     pub fn make_random_web(num_nodes: usize, num_edges: usize) -> Self {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
+        let mut node_connections = HashMap::<usize, usize>::new();
 
         for n in 0..num_nodes {
             // Create node with random parameters
@@ -84,7 +98,9 @@ impl MorassWeb {
                 decay_percentage: random::<f64>() * 0.05,
                 decay_fixed: random::<f64>() * 0.2,
             };
-            nodes.push(Rc::new(RefCell::new(node)));
+            let rc_node = Rc::new(RefCell::new(node));
+            nodes.push(Rc::clone(&rc_node));
+            node_connections.insert(rc_node.borrow().id, 0);
         }
 
         // Make n random pairs of integers where n=num_edges and each integer is in the range [0, num_nodes)
@@ -101,13 +117,30 @@ impl MorassWeb {
                     println!("Found {} unique pairs", pairs.len());
                     return Self {
                         nodes,
+                        node_connections,
                         edges,
                         pairs,
                         op_counter: 0,
                     };
                 }
             }
+            let node1 = nodes.get(pair.0).unwrap();
+            let node2 = nodes.get(pair.1).unwrap();
             pairs.insert(pair);
+            // For start_node
+            let start_node_id = node1.borrow().id;
+            node_connections
+                .entry(start_node_id)
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+
+            // For end_node
+            let end_node_id = node2.borrow().id;
+            node_connections
+                .entry(end_node_id)
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+
         }
 
         // Create edge with random parameters
@@ -120,6 +153,7 @@ impl MorassWeb {
 
         Self {
             nodes,
+            node_connections,
             edges,
             pairs,
             op_counter: 0,
@@ -150,7 +184,7 @@ impl MorassWeb {
                 node.cooldown_remaining.set(node.cooldown_remaining.get()-1);
             }
         }
-        for edge in &self.edges {
+        for edge in self.edges.iter() {
             let edge = edge.borrow();
             if edge.end_node.borrow().since_last_fire.get() == edge.end_node_fire_within { // Only penalise once
                 edge.edge_health.set(edge.edge_health.get()-1);
@@ -169,6 +203,20 @@ impl MorassWeb {
         for i in to_remove.iter().rev() {
             let edge = self.edges.remove(*i);
             let pair = (edge.borrow().start_node.borrow().id, edge.borrow().end_node.borrow().id);
+            // For start_node
+            let start_node_id = edge.borrow().start_node.borrow().id;
+            self.node_connections
+                .entry(start_node_id)
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+
+            // For end_node
+            let end_node_id = edge.borrow().end_node.borrow().id;
+            self.node_connections
+                .entry(end_node_id)
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
+
             self.pairs.remove(&pair);
         }
     }
@@ -290,32 +338,66 @@ impl MorassWeb {
     }
 
     pub fn add_edges_to_random_node(&mut self, num_edges: usize, max_tries: usize) {
-        let mut target_node = random::<usize>() % self.nodes.len();
-        let mut tries = 1;
-        while self.nodes[target_node].borrow().num_outgoing_edges.get() + num_edges >= self.nodes.len() {
-            // If the target node has too many outgoing edges, pick a new target node
-            target_node = random::<usize>() % self.nodes.len();
-        }
-        let mut new_pairs = HashSet::<(usize, usize)>::new();
-        for _ in 0..num_edges {
-            let mut pair = (random::<usize>() % self.nodes.len(), random::<usize>() % self.nodes.len());
-            while pair.0 == pair.1 ||
-                self.pairs.contains(&pair) ||
-                self.pairs.contains(&(pair.1, pair.0)) {
-                pair = (target_node, random::<usize>() % self.nodes.len());
-                tries += 1;
-                if tries > max_tries {
-                    return;
-                }
+        let mut tries = 0;
+        let prior_total_edges = self.edges.len();
+        // Identify the nodes that can have edges added
+        let mut available_nodes = Vec::<usize>::new();
+        for (i, node) in self.nodes.iter().enumerate() {
+            if *self.node_connections.get(&node.borrow().id).unwrap() < &self.nodes.len()-1 {
+                available_nodes.push(i);
             }
-            self.pairs.insert(pair);
-            new_pairs.insert(pair);
         }
-        for pair in new_pairs.iter() {
-            // Create edge with random parameters
-            let edge = MorassWeb::default_edge(self.nodes.get(pair.0).unwrap(),
-                                               self.nodes.get(pair.1).unwrap());
-            self.edges.push(Rc::new(RefCell::new(edge)));
+        // Randomly pick from the available nodes
+        let _available_target_node_index = random::<usize>() % available_nodes.len();
+        let target_node_index = available_nodes[_available_target_node_index];
+        let target_node = &self.nodes[target_node_index];
+        'main: while tries < max_tries {
+            let mut loop_tries = 0;
+            // let target_node_index = random::<usize>() % self.nodes.len();
+            // let target_node = &self.nodes[target_node_index];
+            let existing_edges = target_node.borrow().num_outgoing_edges.get();
+
+            // Calculate the maximum number of new edges that can be added
+            let max_new_edges = self.nodes.len() - 1 - existing_edges;
+            let edges_to_add = std::cmp::min(num_edges, max_new_edges);
+
+            if edges_to_add == 0 {
+                // This node cannot have any more edges, try another node
+                tries += 1;
+                continue;
+            }
+
+            for _ in 0..edges_to_add {
+                let end_node_index = loop {
+                    loop_tries += 1;
+                    let potential_end_node_index = random::<usize>() % self.nodes.len();
+                    if potential_end_node_index != target_node_index &&
+                        !self.pairs.contains(&(target_node_index, potential_end_node_index)) &&
+                        !self.pairs.contains(&(potential_end_node_index, target_node_index)) {
+                        break potential_end_node_index;
+                    }
+                    if loop_tries == 1000 {
+                        tries += 1;
+                        // println!("Could not find a valid end node after {} tries", loop_tries);
+                        continue 'main;
+                    }
+                };
+
+                let end_node = &self.nodes[end_node_index];
+                let edge = MorassWeb::default_edge(target_node, end_node);
+                self.edges.push(Rc::new(RefCell::new(edge)));
+                self.pairs.insert((target_node_index, end_node_index));
+                target_node.borrow_mut().num_outgoing_edges.set(existing_edges + 1);
+            }
+
+            if self.edges.len() == prior_total_edges {
+                // No edges were added, try again
+                tries += 1;
+                continue;
+            }
+
+            // Successfully added edges, no need to try more
+            break;
         }
     }
 
@@ -326,4 +408,5 @@ impl MorassWeb {
     pub fn show_edge_counter(&self) -> usize {
         self.edges.len()
     }
+
 }
