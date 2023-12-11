@@ -5,7 +5,7 @@ use std::time::Instant;
 
 fn main() {
     let start = Instant::now();
-    let mut w = web::MorassWeb::make_random_web(100, 1_000);
+    let mut w = web::MorassWeb::make_random_web(1000, 10_000);
 
     for _ in 0..1000 {
         web::step(&mut w, false);

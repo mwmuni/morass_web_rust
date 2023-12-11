@@ -25,6 +25,8 @@ pub struct Node {
     id: usize,
     threshold: f64,
     charge: Cell<f64>,
+    cooldown: usize,
+    cooldown_remaining: usize,
     temp_charge: Cell<f64>,
     charge_consumption_percentage: f64,
     charge_consumption_fixed: f64,
@@ -58,6 +60,11 @@ pub fn step(web: &mut MorassWeb, verbose: bool) {
         let start_node = edge.start_node.borrow();
         let end_node = edge.end_node.borrow_mut();
 
+        // If the start node or end node is on cooldown, skip it
+        if start_node.cooldown_remaining > 0 || end_node.cooldown_remaining > 0 {
+            continue;
+        }
+
         let pulse = if start_node.charge.get() >= start_node.threshold {
             start_node.charge.get() * edge.out_percentage + edge.out_fixed
         } else {
@@ -77,6 +84,10 @@ pub fn step(web: &mut MorassWeb, verbose: bool) {
 
     // Subtraction of charge from nodes if fired
     for node in &web.nodes {
+        // If the node is on cooldown, skip it
+        if node.borrow().cooldown_remaining > 0 {
+            continue;
+        }
         let node = node.borrow_mut();
         if node.charge.get() >= node.threshold {
             node.charge.set(
@@ -100,6 +111,14 @@ pub fn step(web: &mut MorassWeb, verbose: bool) {
         node.charge.set(node.charge.get() + node.temp_charge.get());
         node.temp_charge.set(0.0);
     }
+
+    // Decrement cooldowns
+    for node in &web.nodes {
+        let mut node = node.borrow_mut();
+        if node.cooldown_remaining > 0 {
+            node.cooldown_remaining -= 1;
+        }
+    }
 }
 
 impl MorassWeb {
@@ -113,6 +132,8 @@ impl MorassWeb {
                 id: n + 1,
                 threshold: random::<f64>() * 10.0,
                 charge: Cell::new(random::<f64>() * 5.0),
+                cooldown: random::<usize>() % 5 + 1,
+                cooldown_remaining: 0,
                 temp_charge: Cell::new(0.0),
                 charge_consumption_percentage: random::<f64>() * 20.0,
                 charge_consumption_fixed: random::<f64>() * 3.0,
@@ -152,14 +173,15 @@ impl MorassWeb {
         }
     }
 
-    pub fn inject_node_index(&self, index: usize, input: f64) {
-        let node = &self.nodes[index].borrow_mut();
-        node.charge.set(node.charge.get() + input);
-    }
-
     fn inject_node(node: &Node, input: f64) {
         node.charge.set(node.charge.get() + input);
     }
+
+    pub fn inject_node_index(&self, index: usize, input: f64) {
+        let node = &self.nodes[index].borrow_mut();
+        MorassWeb::inject_node(&node, input);
+    }
+
 
     // Show the current charge of all nodes
     pub fn show_nodes(&self) {
