@@ -1,9 +1,11 @@
 use rand::random;
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::rc::Rc;
+use std::ops::{Add, AddAssign, DerefMut};
+use rayon::prelude::*;
+use std::sync::{Arc, RwLock};
+use rand::distributions::uniform::SampleBorrow;
 
 // Prototype neural network that focuses on facilitating an all-node-input-all-node-output network. The idea is that all neurons in the brain are interconnected and are used as both input and output simultaneously.
 //
@@ -27,12 +29,10 @@ use std::rc::Rc;
 pub struct Node {
     id: usize,
     threshold: f64,
-    charge: Cell<f64>,
+    charge: f64,
     cooldown: usize,
-    cooldown_remaining: Cell<usize>,
-    since_last_fire: Cell<usize>,
-    temp_charge: Cell<f64>,
-    num_outgoing_edges: Cell<usize>,
+    cooldown_remaining: usize,
+    since_last_fire: usize,
     charge_consumption_percentage: f64,
     charge_consumption_fixed: f64,
     decay_percentage: f64,
@@ -58,20 +58,22 @@ impl Eq for Node {}
 pub struct Edge {
     out_percentage: f64,
     out_fixed: f64,
-    edge_health: Cell<usize>, // Number of failed steps before the edge is removed
-    last_fire: Cell<usize>, // Number of steps since the edge last fired
+    edge_health: usize, // Number of failed steps before the edge is removed
+    last_fire: usize, // Number of steps since the edge last fired
     fire_within: usize, // Number of steps that the start_node needs to fire within otherwise edge_health is decremented
     end_node_fire_within: usize, // Number of steps that the end_node needs to fire within otherwise edge_health is decremented
-    start_node: Rc<RefCell<Node>>,
-    end_node: Rc<RefCell<Node>>,
+    start_node: Arc<RwLock<Node>>,
+    end_node: Arc<RwLock<Node>>,
 }
 
 pub struct MorassWeb {
-    nodes: Vec<Rc<RefCell<Node>>>,
-    node_connections: HashMap<usize, usize>,
-    edges: Vec<Rc<RefCell<Edge>>>,
-    pairs: HashSet<(usize, usize)>, // usize representation of edges
-    op_counter: usize,
+    nodes: Vec<Arc<RwLock<Node>>>,
+    edges: Vec<Arc<RwLock<Edge>>>,
+    node_temp_charges: Vec<Arc<RwLock<f64>>>,
+    node_last_fired: Vec<Arc<RwLock<usize>>>,
+    pairs: Arc<RwLock<HashSet<(usize, usize)>>>, // usize representation of edges
+    op_counter: Arc<RwLock<usize>>,
+    edges_added_counter: Arc<RwLock<usize>>,
 }
 
 
@@ -80,320 +82,354 @@ impl MorassWeb {
     pub fn make_random_web(num_nodes: usize, num_edges: usize) -> Self {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
-        let mut node_connections = HashMap::<usize, usize>::new();
+        let mut node_temp_charges = Vec::new();
+        let mut node_last_fired = Vec::new();
 
         for n in 0..num_nodes {
             // Create node with random parameters
             let node = Node {
                 id: n + 1,
                 threshold: random::<f64>() * 10.0,
-                charge: Cell::new(random::<f64>() * 5.0),
+                charge: random::<f64>() * 5.0,
                 cooldown: random::<usize>() % 5 + 1,
-                cooldown_remaining: Cell::new(0),
-                since_last_fire: Cell::new(0),
-                temp_charge: Cell::new(0.0),
-                num_outgoing_edges: Cell::new(0),
+                cooldown_remaining: 0,
+                since_last_fire: 0,
                 charge_consumption_percentage: random::<f64>() * 20.0,
                 charge_consumption_fixed: random::<f64>() * 3.0,
                 decay_percentage: random::<f64>() * 0.05,
                 decay_fixed: random::<f64>() * 0.2,
             };
-            let rc_node = Rc::new(RefCell::new(node));
-            nodes.push(Rc::clone(&rc_node));
-            node_connections.insert(rc_node.borrow().id, 0);
+            let rc_node = Arc::new(RwLock::new(node));
+            nodes.push(Arc::clone(&rc_node));
+        }
+
+        for _ in 0..num_nodes {
+            node_temp_charges.push(Arc::new(RwLock::new(0.0)));
+            node_last_fired.push(Arc::new(RwLock::new(0)));
         }
 
         // Make n random pairs of integers where n=num_edges and each integer is in the range [0, num_nodes)
         // Each pair is unique, (i, i) is not allowed, and (i, j) is the same as (j, i)
-        let mut pairs = HashSet::<(usize, usize)>::new();
+        let pairs: Arc<RwLock<HashSet<(usize, usize)>>> = Arc::new(RwLock::new(HashSet::new()));
         let mut tries = 0;
         for _ in 0..num_edges {
-            let mut pair = (random::<usize>() % num_nodes, random::<usize>() % num_nodes);
-            while pair.0 == pair.1 || pairs.contains(&pair) || pairs.contains(&(pair.1, pair.0)) {
-                pair = (random::<usize>() % num_nodes, random::<usize>() % num_nodes);
+            let pair = loop {
                 tries += 1;
+                let ret = (random::<usize>() % num_nodes, random::<usize>() % num_nodes);
+                if ret.0 != ret.1 && !pairs.read().unwrap().contains(&ret) && !pairs.read().unwrap().contains(&(ret.1, ret.0)) {
+                    break ret;
+                };
                 if tries > 1000 {
                     println!("Could not find {} unique pairs", num_edges);
-                    println!("Found {} unique pairs", pairs.len());
+                    println!("Found {} unique pairs", pairs.read().unwrap().len());
                     return Self {
                         nodes,
-                        node_connections,
                         edges,
+                        node_temp_charges,
+                        node_last_fired,
                         pairs,
-                        op_counter: 0,
+                        op_counter: Arc::new(RwLock::new(0)),
+                        edges_added_counter: Arc::new(RwLock::new(0)),
                     };
                 }
-            }
-            let node1 = nodes.get(pair.0).unwrap();
-            let node2 = nodes.get(pair.1).unwrap();
-            pairs.insert(pair);
-            // For start_node
-            let start_node_id = node1.borrow().id;
-            node_connections
-                .entry(start_node_id)
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-
-            // For end_node
-            let end_node_id = node2.borrow().id;
-            node_connections
-                .entry(end_node_id)
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-
+            };
+            pairs.write().unwrap().insert(pair);
         }
 
         // Create edge with random parameters
-        for pair in pairs.iter() {
+        for pair in pairs.read().unwrap().iter() {
             // Create edge with random parameters
             let edge = MorassWeb::default_edge(nodes.get(pair.0).unwrap(),
                                                nodes.get(pair.1).unwrap());
-            edges.push(Rc::new(RefCell::new(edge)));
+            edges.push(Arc::new(RwLock::new(edge)));
         }
 
         Self {
             nodes,
-            node_connections,
             edges,
+            node_temp_charges,
+            node_last_fired,
             pairs,
-            op_counter: 0,
+            op_counter: Arc::new(RwLock::new(0)),
+            edges_added_counter: Arc::new(RwLock::new(0)),
         }
     }
 
-    pub fn step(&mut self, verbose: bool) {
-        // Process all node threshold outputs to connected nodes and store the output in a temporary variable in the destination node
-        self.pulse(verbose);
-
-        // Subtraction of charge from nodes if fired
-        self.subtract_charge();
-
-        // Decay all the nodes by some percentage and fixed amount
-        self.decay();
-
-        // Assimilate the temporary charge from step 1 with the current charge
-        self.assimilate();
-
-        // Decrement cooldowns
-        self.cooldown_step();
+    fn assimilate(&mut self, node: &Arc<RwLock<Node>>) {
+        let mut node = node.write().unwrap();
+        node.charge = self.node_temp_charges[node.id-1].read().unwrap().add(node.charge);
+        self.node_temp_charges[node.id-1].write().unwrap().clone_from(&0.0);
     }
 
-    fn cooldown_step(&mut self) {
-        for node in &self.nodes {
-            let node = node.borrow();
-            if node.cooldown_remaining.get() > 0 {
-                node.cooldown_remaining.set(node.cooldown_remaining.get()-1);
-            }
-        }
-        for edge in self.edges.iter() {
-            let edge = edge.borrow();
-            if edge.end_node.borrow().since_last_fire.get() == edge.end_node_fire_within { // Only penalise once
-                edge.edge_health.set(edge.edge_health.get()-1);
-            }
-            if edge.last_fire.get() % edge.fire_within == edge.fire_within-1 {
-                edge.edge_health.set(edge.edge_health.get()-1);
-            }
-        }
-        // Delete any edges with edge_health == 0 and their corresponding pairs
-        let mut to_remove = Vec::<usize>::new();
-        for (i, edge) in self.edges.iter().enumerate() {
-            if edge.borrow().edge_health.get() == 0 {
-                to_remove.push(i);
-            }
-        }
-        for i in to_remove.iter().rev() {
-            let edge = self.edges.remove(*i);
-            let pair = (edge.borrow().start_node.borrow().id, edge.borrow().end_node.borrow().id);
-            // For start_node
-            let start_node_id = edge.borrow().start_node.borrow().id;
-            self.node_connections
-                .entry(start_node_id)
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-
-            // For end_node
-            let end_node_id = edge.borrow().end_node.borrow().id;
-            self.node_connections
-                .entry(end_node_id)
-                .and_modify(|e| *e += 1)
-                .or_insert(1);
-
-            self.pairs.remove(&pair);
-        }
-    }
-
-    fn assimilate(&self) {
-        for node in &self.nodes {
-            let node = node.borrow();
-            node.charge.set(node.charge.get() + node.temp_charge.get());
-            node.temp_charge.set(0.0);
-        }
-    }
-
-    fn decay(&self) {
-        for node in &self.nodes {
-            let node = node.borrow();
-            node.charge
-                .set(node.charge.get() - node.charge.get() * node.decay_percentage - node.decay_fixed);
-        }
-    }
-
-    fn subtract_charge(&self) {
-        for node in &self.nodes {
-            // If the node is on cooldown, skip it
-            if node.borrow().cooldown_remaining.get() > 0 {
-                continue;
-            }
-            let node = node.borrow_mut();
-            if node.charge.get() >= node.threshold {
-                node.charge.set(
-                    node.charge.get()
-                        - node.charge.get() * node.charge_consumption_percentage
-                        - node.charge_consumption_fixed,
-                );
-            }
-        }
-    }
-
-    fn pulse(&mut self, verbose: bool) {
-        for _edge in &self.edges {
-            let edge = _edge.borrow();
-            let start_node = edge.start_node.borrow();
-            let end_node = edge.end_node.borrow();
+    fn pulse(&mut self, edge: &Arc<RwLock<Edge>>, verbose: bool) -> bool {
+        // Read phase
+        let (start_node_charge, start_node_threshold, start_node_cooldown, out_percentage, out_fixed, end_node_cooldown, end_node_since_last_fire, last_fire) = {
+            let edge_read = edge.read().unwrap();
+            let start_node_read = edge_read.start_node.read().unwrap();
 
             // If the start node or end node is on cooldown, skip it
-            if start_node.cooldown_remaining.get() > 0 {
-                continue;
+            if start_node_read.cooldown_remaining > 0 {
+                return false;
+            }
+            let end_node_read = edge_read.end_node.read().unwrap();
+
+            (
+                start_node_read.charge,
+                start_node_read.threshold,
+                start_node_read.cooldown,
+                edge_read.out_percentage,
+                edge_read.out_fixed,
+                end_node_read.cooldown,
+                end_node_read.since_last_fire,
+                edge_read.last_fire,
+            )
+        };
+
+        // Compute pulse
+        let pulse = if start_node_charge >= start_node_threshold {
+            start_node_charge * out_percentage + out_fixed
+        } else {
+            0.0
+        };
+
+        // Write phase
+        if pulse > 0.0 {
+            'startnode: loop {
+                let edge_read = edge.read().unwrap();
+                let start_node_lock = edge_read.start_node.read();
+                if start_node_lock.is_err() {
+                    continue 'startnode;
+                }
+                let read_start_node = start_node_lock.unwrap();
+                self.node_temp_charges[read_start_node.id-1].write().unwrap().add_assign(&pulse);
+                self.node_last_fired[read_start_node.id-1].write().unwrap().clone_from(&0);
+                break 'startnode;
+            }
+            'endnode: loop {
+                let edge_read = edge.read().unwrap();
+                let end_node_lock = edge_read.end_node.read();
+                if end_node_lock.is_err() {
+                    continue 'endnode;
+                }
+                let read_end_node = end_node_lock.unwrap();
+                self.node_temp_charges[read_end_node.id-1].write().unwrap().add_assign(&pulse);
+                self.node_last_fired[read_end_node.id-1].write().unwrap().clone_from(&0);
+                break 'endnode;
+            }
+            {
+                let mut write_edge = edge.write().unwrap();
+                write_edge.last_fire = 0;
             }
 
-            let pulse = if start_node.charge.get() >= start_node.threshold {
-                start_node.charge.get() * edge.out_percentage + edge.out_fixed
-            } else {
-                0.0
-            };
-            if pulse > 0.0 {
-                self.op_counter += 1;
-                start_node.cooldown_remaining.set(start_node.cooldown);
-                end_node.temp_charge.set(end_node.temp_charge.get() + pulse);
-                start_node.since_last_fire.set(0);
-                edge.last_fire.set(0);
-            } else {
-                edge.last_fire.set(edge.last_fire.get()+1);
-            }
             if verbose {
                 println!(
                     "Node {} fired on edge {}->{} with pulse {}",
-                    start_node.id, start_node.id, end_node.id, pulse
+                    edge.read().unwrap().start_node.read().unwrap().id,
+                    edge.read().unwrap().start_node.read().unwrap().id,
+                    edge.read().unwrap().end_node.read().unwrap().id,
+                    pulse
                 );
+            }
+
+            true
+        } else {
+            let mut write_edge = edge.write().unwrap();
+            write_edge.last_fire = last_fire + 1;
+            false
+        }
+    }
+
+
+    pub fn step(&mut self, verbose: bool) {
+        let op_counter: usize = self.edges.par_iter()
+            .map(|edge| {
+                if self.pulse(edge, verbose) { 1 } else { 0 }
+            })
+            .sum();
+
+        self.nodes.par_iter().for_each(|node| {
+            // println!("About to subtract charge");
+            MorassWeb::subtract_charge(node);
+            // println!("About to decay");
+            MorassWeb::decay(node);
+            // println!("About to assimilate");
+            self.assimilate(node);
+            // println!("About to cooldown");
+            MorassWeb::cooldown_step(node);
+        });
+
+        self.edges.par_iter().for_each(|edge| {
+            // println!("About to penalise");
+            MorassWeb::penalise(edge);
+        });
+        // println!("About to retain");
+        self.pairs.write().unwrap().retain(|pair| {
+            let start_node = self.nodes.get(pair.0).unwrap();
+            let end_node = self.nodes.get(pair.1).unwrap();
+            let start_node_read = start_node.read().unwrap();
+            let end_node_read = end_node.read().unwrap();
+            start_node_read.cooldown_remaining <= 0 && end_node_read.cooldown_remaining <= 0
+        });
+
+        // Handling self.edges.retain in parallel might be complex due to mutable references
+        self.edges.retain(|edge| edge.read().unwrap().edge_health > 0);
+        let mut op_lock = self.op_counter.write().unwrap();
+        *op_lock += op_counter;
+        // println!("finished step");
+    }
+
+    fn cooldown_step(node: &Arc<RwLock<Node>>) {
+        let mut node = node.write().unwrap();
+        if node.cooldown_remaining > 0 {
+            node.cooldown_remaining = node.cooldown_remaining - 1;
+        }
+    }
+
+    fn penalise(edge: &Arc<RwLock<Edge>>) {
+        let mut edge = edge.write().unwrap();
+        if edge.end_node.read().unwrap().since_last_fire == edge.end_node_fire_within { // Only penalise once
+            edge.edge_health = max(edge.edge_health, 1) - 1;
+        }
+        if edge.last_fire % edge.fire_within == edge.fire_within-1 {
+            edge.edge_health = max(edge.edge_health, 1) - 1;
+        }
+    }
+
+
+
+    fn decay(node: &Arc<RwLock<Node>>) {
+        let mut node = node.write().unwrap();
+        node.charge = node.charge - node.charge * node.decay_percentage - node.decay_fixed;
+    }
+
+    fn subtract_charge(node: &Arc<RwLock<Node>>) {
+        // If the node is on cooldown, skip it
+        let mut node = node.write().unwrap();
+        if node.cooldown_remaining <= 0 {
+            if node.charge >= node.threshold {
+                node.charge =
+                    node.charge
+                        - node.charge * node.charge_consumption_percentage
+                        - node.charge_consumption_fixed;
             }
         }
     }
 
-    pub fn default_edge(start_node: &Rc<RefCell<Node>>, end_node: &Rc<RefCell<Node>>) -> Edge {
+
+
+    pub fn default_edge(start_node: &Arc<RwLock<Node>>, end_node: &Arc<RwLock<Node>>) -> Edge {
         Edge {
             out_percentage: random::<f64>(),
             out_fixed: random::<f64>() * 5.0,
-            edge_health: Cell::new(3),
-            last_fire: Cell::new(0),
+            edge_health: 3,
+            last_fire: 0,
             fire_within: 5,
             end_node_fire_within: 3,
-            start_node: Rc::clone(start_node),
-            end_node: Rc::clone(end_node),
+            start_node: Arc::clone(start_node),
+            end_node: Arc::clone(end_node),
         }
     }
 
-    fn inject_node(node: &Node, input: f64) {
-        node.charge.set(node.charge.get() + input);
-    }
-
     pub fn inject_node_index(&self, index: usize, input: f64) {
-        let node = &self.nodes[index].borrow_mut();
-        MorassWeb::inject_node(&node, input);
+        let mut node = self.nodes[index].write().unwrap();
+        node.charge += input;
     }
 
 
     // Show the current charge of all nodes
     pub fn show_nodes(&self) {
         for node in &self.nodes {
-            let node = node.borrow();
-            println!("Node {} has charge {}", node.id, node.charge.get());
+            let node = node.read().unwrap();
+            println!("Node {} has charge {}", node.id, node.charge);
         }
     }
 
     // Show the topology of the network
     pub fn show_edges(&self) {
         for edge in &self.edges {
-            let edge = edge.borrow();
+            let edge = edge.read().unwrap();
             println!(
                 "Edge {}->{} has out_percentage {} and out_fixed {}",
-                edge.start_node.borrow().id,
-                edge.end_node.borrow().id,
+                edge.start_node.read().unwrap().id,
+                edge.end_node.read().unwrap().id,
                 edge.out_percentage,
                 edge.out_fixed
             );
         }
     }
 
-    pub fn show_op_counter(&self) -> usize {
-        self.op_counter
+    pub fn get_op_counter(&self) -> usize {
+        self.op_counter.read().unwrap().clone()
+    }
+
+    pub fn get_added_edges(&self) -> usize {
+        self.edges_added_counter.read().unwrap().clone()
     }
 
     pub fn add_edges_to_random_node(&mut self, num_edges: usize, max_tries: usize) {
         let mut tries = 0;
         let prior_total_edges = self.edges.len();
-        // Identify the nodes that can have edges added
-        let mut available_nodes = Vec::<usize>::new();
-        for (i, node) in self.nodes.iter().enumerate() {
-            if *self.node_connections.get(&node.borrow().id).unwrap() < &self.nodes.len()-1 {
-                available_nodes.push(i);
-            }
+        // Tally the number of outgoing edges for each node
+        let mut arr_count = vec![0; self.nodes.len()];
+        for edge in &self.edges {
+            let edge = edge.read().unwrap();
+            arr_count[edge.start_node.read().unwrap().id - 1] += 1;
         }
-        // Randomly pick from the available nodes
-        let _available_target_node_index = random::<usize>() % available_nodes.len();
-        let target_node_index = available_nodes[_available_target_node_index];
-        let target_node = &self.nodes[target_node_index];
+
+        // Identify the nodes that can have edges added
+        let available_nodes: Vec<usize> =
+            arr_count.iter().enumerate().filter_map(|(i, &x)| if x < self.nodes.len() - 1 {
+                Some(i)
+            } else {
+                None
+            }).collect();
+        if available_nodes.len() == 0 {
+            // println!("No nodes can have any more edges");
+            return;
+        }
         'main: while tries < max_tries {
+            // Randomly pick from the available nodes
+            let _available_target_node_index = random::<usize>() % available_nodes.len();
+            let target_node_index = available_nodes[_available_target_node_index];
             let mut loop_tries = 0;
-            // let target_node_index = random::<usize>() % self.nodes.len();
-            // let target_node = &self.nodes[target_node_index];
-            let existing_edges = target_node.borrow().num_outgoing_edges.get();
+            // Calculate the number of existing edges
+            let existing_edges = arr_count[target_node_index];
+
+            let unconnected_nodes: Vec<usize> = (0..self.nodes.len()).filter_map(|i| {
+                if !self.pairs.read().unwrap().contains(&(target_node_index, i+1)) {
+                    Some(i)
+                } else {
+                    None
+                }
+            }).collect();
 
             // Calculate the maximum number of new edges that can be added
-            let max_new_edges = self.nodes.len() - 1 - existing_edges;
+            let max_new_edges = unconnected_nodes.len();
             let edges_to_add = std::cmp::min(num_edges, max_new_edges);
 
             if edges_to_add == 0 {
                 // This node cannot have any more edges, try another node
                 tries += 1;
-                continue;
+                continue 'main;
             }
 
-            for _ in 0..edges_to_add {
-                let end_node_index = loop {
-                    loop_tries += 1;
-                    let potential_end_node_index = random::<usize>() % self.nodes.len();
-                    if potential_end_node_index != target_node_index &&
-                        !self.pairs.contains(&(target_node_index, potential_end_node_index)) &&
-                        !self.pairs.contains(&(potential_end_node_index, target_node_index)) {
-                        break potential_end_node_index;
-                    }
-                    if loop_tries == 1000 {
-                        tries += 1;
-                        // println!("Could not find a valid end node after {} tries", loop_tries);
-                        continue 'main;
-                    }
-                };
+            for i in 0..edges_to_add {
+                let end_node_index = unconnected_nodes[i];
 
-                let end_node = &self.nodes[end_node_index];
-                let edge = MorassWeb::default_edge(target_node, end_node);
-                self.edges.push(Rc::new(RefCell::new(edge)));
-                self.pairs.insert((target_node_index, end_node_index));
-                target_node.borrow_mut().num_outgoing_edges.set(existing_edges + 1);
+                let edge = MorassWeb::default_edge(
+                    &self.nodes[target_node_index],
+                    &self.nodes[end_node_index]
+                );
+                self.edges.push(Arc::new(RwLock::new(edge)));
+                self.pairs.write().unwrap().insert((target_node_index, end_node_index));
+                let mut edge_count_lock = self.edges_added_counter.write().unwrap();
+                *edge_count_lock += 1;
             }
 
             if self.edges.len() == prior_total_edges {
                 // No edges were added, try again
                 tries += 1;
-                continue;
+                continue 'main;
             }
 
             // Successfully added edges, no need to try more
